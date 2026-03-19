@@ -1,0 +1,718 @@
+#!/usr/bin/env python3
+"""Auto Clicker — GTK4 / libadwaita mouse automation tool."""
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+gi.require_version('Gdk', '4.0')
+from gi.repository import Gtk, Adw, Gdk, GLib
+
+import json
+import os
+import random
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+# Force pynput to use the evdev backend so keyboard events are read directly
+# from /dev/input/event* rather than via XRecord (which misses Wayland windows).
+os.environ['PYNPUT_BACKEND'] = 'evdev'
+
+try:
+    from pynput import keyboard
+    PYNPUT_AVAILABLE = True
+except ImportError:
+    PYNPUT_AVAILABLE = False
+
+CONFIG_PATH = Path.home() / '.config' / 'clicker' / 'config.json'
+
+BUTTON_CODES  = {'Left': '0xC0110', 'Right': '0xC0111', 'Middle': '0xC0112'}
+BUTTON_LABELS = ['Left', 'Right', 'Middle']
+
+# Pure-modifier keysyms — don't record these as hotkeys on their own
+_MODIFIER_KEYSYMS = frozenset([
+    Gdk.KEY_Control_L, Gdk.KEY_Control_R,
+    Gdk.KEY_Shift_L,   Gdk.KEY_Shift_R,
+    Gdk.KEY_Alt_L,     Gdk.KEY_Alt_R,
+    Gdk.KEY_Super_L,   Gdk.KEY_Super_R,
+    Gdk.KEY_ISO_Level3_Shift,
+    Gdk.KEY_Caps_Lock, Gdk.KEY_Num_Lock, Gdk.KEY_Scroll_Lock,
+])
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def ydotoold_running() -> bool:
+    try:
+        return subprocess.run(['pgrep', 'ydotoold'], capture_output=True).returncode == 0
+    except Exception:
+        return False
+
+
+def _ensure_ydotoold() -> bool:
+    """Start ydotoold in the background if not already running. Returns True if running."""
+    if ydotoold_running():
+        return True
+    try:
+        subprocess.Popen(['ydotoold'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except FileNotFoundError:
+        print('ydotoold not found — install ydotool', file=sys.stderr)
+        return False
+    except Exception as exc:
+        print(f'Failed to start ydotoold: {exc}', file=sys.stderr)
+        return False
+
+
+def _normalize_pynput_key(key) -> str | None:
+    """Normalize a pynput key to the same token format produced by _gdk_to_pynput."""
+    try:
+        name = key.name
+        for suffix in ('_l', '_r'):
+            if name.endswith(suffix):
+                name = name[:-len(suffix)]
+                break
+        return f'<{name}>'
+    except AttributeError:
+        char = getattr(key, 'char', None)
+        return char.lower() if char else None
+
+
+def _gdk_to_pynput(keyval: int, state: Gdk.ModifierType) -> tuple[str, str]:
+    """Return (pynput_hotkey_string, human_display_string) from a GTK key event."""
+    parts: list[str] = []
+    display: list[str] = []
+
+    if state & Gdk.ModifierType.CONTROL_MASK:
+        parts.append('<ctrl>')
+        display.append('Ctrl')
+    if state & Gdk.ModifierType.ALT_MASK:
+        parts.append('<alt>')
+        display.append('Alt')
+    if state & Gdk.ModifierType.SUPER_MASK:
+        parts.append('<super>')
+        display.append('Super')
+    if state & Gdk.ModifierType.SHIFT_MASK:
+        parts.append('<shift>')
+        display.append('Shift')
+
+    name = Gdk.keyval_name(keyval) or ''
+    if len(name) == 1:
+        # Regular printable key — pynput uses bare char, no angle brackets
+        parts.append(name.lower())
+        display.append(name.upper())
+    else:
+        # Special key (F1-F12, Return, Tab, space, …)
+        parts.append(f'<{name.lower()}>')
+        display.append(name)          # keep original case for readability
+
+    return '+'.join(parts), ' + '.join(display)
+
+
+# ── Application ────────────────────────────────────────────────────────────
+
+class ClickerApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id='io.github.clicker')
+        self.connect('activate', self._on_activate)
+
+    def _on_activate(self, app):
+        # Apply saved theme before the window is created so there is no flash
+        config = {}
+        if CONFIG_PATH.exists():
+            try:
+                config = json.loads(CONFIG_PATH.read_text())
+            except Exception:
+                pass
+        theme = config.get('theme', 'system')
+        scheme = {
+            'light': Adw.ColorScheme.FORCE_LIGHT,
+            'dark':  Adw.ColorScheme.FORCE_DARK,
+        }.get(theme, Adw.ColorScheme.DEFAULT)
+        app.get_style_manager().set_color_scheme(scheme)
+
+        MainWindow(application=app).present()
+
+
+class MainWindow(Adw.ApplicationWindow):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.set_title('Auto Clicker')
+        self.set_default_size(480, 720)
+
+        self.clicking       = False
+        self.stop_event     = threading.Event()
+        self.click_thread: threading.Thread | None = None
+        self.hotkey_listener  = None
+        self.position_listener = None
+
+        self.config = self._load_config()
+        self._build_ui()
+        self._apply_theme(self.config.get('theme', 'system'))
+        self._setup_hotkey()
+        self.connect('close-request', self._on_close_request)
+
+    # ── Config ─────────────────────────────────────────────────────────────
+
+    def _load_config(self) -> dict:
+        if CONFIG_PATH.exists():
+            try:
+                return json.loads(CONFIG_PATH.read_text())
+            except Exception:
+                pass
+        return {}
+
+    def _save_config(self):
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(self.config, indent=2))
+
+    # ── UI ─────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        toolbar_view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        toolbar_view.add_top_bar(header)
+
+        view_stack = Adw.ViewStack()
+        switcher   = Adw.ViewSwitcher()
+        switcher.set_stack(view_stack)
+        switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
+        header.set_title_widget(switcher)
+
+        view_stack.add_titled_with_icon(
+            self._build_clicker_page(), 'clicker', 'Clicker', 'input-mouse-symbolic')
+        view_stack.add_titled_with_icon(
+            self._build_settings_page(), 'settings', 'Settings', 'preferences-system-symbolic')
+
+        toolbar_view.set_content(view_stack)
+
+        self._daemon_banner = Adw.Banner()
+        self._daemon_banner.set_title('ydotoold is not running — clicks may be slow or fail')
+        self._daemon_banner.set_button_label('How to fix')
+        self._daemon_banner.connect('button-clicked', self._on_daemon_help)
+        self._daemon_banner.set_revealed(not ydotoold_running())
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.append(self._daemon_banner)
+        outer.append(toolbar_view)
+        toolbar_view.set_vexpand(True)
+        self.set_content(outer)
+
+    # ── Clicker page ────────────────────────────────────────────────────────
+
+    def _build_clicker_page(self) -> Gtk.Widget:
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        box.set_margin_top(24)
+        box.set_margin_bottom(24)
+        box.set_margin_start(24)
+        box.set_margin_end(24)
+
+        box.append(self._build_target_section())
+        box.append(self._build_button_section())
+        box.append(self._build_timing_section())
+        box.append(self._build_count_section())
+        box.append(self._build_hotkey_section())
+        box.append(self._build_start_section())
+
+        scroll.set_child(box)
+        return scroll
+
+    def _build_target_section(self) -> Gtk.Widget:
+        cfg = self.config
+        use_fixed = cfg.get('target') == 'fixed'
+
+        mode_group = Adw.PreferencesGroup()
+        mode_group.set_title('Click Target')
+
+        self._current_radio = Gtk.CheckButton()
+        self._current_radio.set_active(not use_fixed)
+        current_row = Adw.ActionRow()
+        current_row.set_title('Current cursor position')
+        current_row.add_prefix(self._current_radio)
+        current_row.set_activatable_widget(self._current_radio)
+
+        self._fixed_radio = Gtk.CheckButton()
+        self._fixed_radio.set_group(self._current_radio)
+        self._fixed_radio.set_active(use_fixed)
+        fixed_row = Adw.ActionRow()
+        fixed_row.set_title('Fixed position')
+        fixed_row.add_prefix(self._fixed_radio)
+        fixed_row.set_activatable_widget(self._fixed_radio)
+
+        mode_group.add(current_row)
+        mode_group.add(fixed_row)
+
+        # Coordinate row (no title — just the widgets)
+        self._coord_group = Adw.PreferencesGroup()
+        coord_row = Adw.ActionRow()
+
+        coord_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        coord_box.set_valign(Gtk.Align.CENTER)
+
+        self._x_spin = Gtk.SpinButton()
+        self._x_spin.set_adjustment(
+            Gtk.Adjustment(value=cfg.get('x', 0), lower=0, upper=9999, step_increment=1))
+        self._x_spin.set_width_chars(6)
+        self._x_spin.set_tooltip_text('X coordinate')
+
+        self._y_spin = Gtk.SpinButton()
+        self._y_spin.set_adjustment(
+            Gtk.Adjustment(value=cfg.get('y', 0), lower=0, upper=9999, step_increment=1))
+        self._y_spin.set_width_chars(6)
+        self._y_spin.set_tooltip_text('Y coordinate')
+
+        self._get_btn = Gtk.Button(label='Get Position')
+        self._get_btn.add_css_class('suggested-action')
+        self._get_btn.set_tooltip_text('Click anywhere on screen to capture coordinates')
+        self._get_btn.connect('clicked', self._on_get_position)
+
+        coord_box.append(Gtk.Label(label='X:'))
+        coord_box.append(self._x_spin)
+        coord_box.append(Gtk.Label(label='Y:'))
+        coord_box.append(self._y_spin)
+        coord_box.append(self._get_btn)
+        coord_row.add_suffix(coord_box)
+        self._coord_group.add(coord_row)
+        self._coord_group.set_sensitive(use_fixed)
+
+        def on_mode_changed(_btn):
+            self._coord_group.set_sensitive(self._fixed_radio.get_active())
+
+        self._current_radio.connect('toggled', on_mode_changed)
+        self._fixed_radio.connect('toggled', on_mode_changed)
+
+        wrapper = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        wrapper.append(mode_group)
+        wrapper.append(self._coord_group)
+        return wrapper
+
+    def _build_button_section(self) -> Gtk.Widget:
+        group = Adw.PreferencesGroup()
+        group.set_title('Mouse Button')
+        self._button_combo = Adw.ComboRow()
+        self._button_combo.set_title('Button')
+        self._button_combo.set_model(Gtk.StringList.new(BUTTON_LABELS))
+        self._button_combo.set_selected(self.config.get('button', 0))
+        group.add(self._button_combo)
+        return group
+
+    def _build_timing_section(self) -> Gtk.Widget:
+        cfg = self.config
+        group = Adw.PreferencesGroup()
+        group.set_title('Timing')
+
+        delay_row = Adw.ActionRow()
+        delay_row.set_title('Delay (ms)')
+        delay_row.set_subtitle('Milliseconds between clicks')
+        self._delay_spin = Gtk.SpinButton()
+        self._delay_spin.set_adjustment(
+            Gtk.Adjustment(value=cfg.get('delay', 1000), lower=1, upper=60000, step_increment=100))
+        self._delay_spin.set_width_chars(7)
+        self._delay_spin.set_valign(Gtk.Align.CENTER)
+        delay_row.add_suffix(self._delay_spin)
+
+        offset_row = Adw.ActionRow()
+        offset_row.set_title('Random offset (ms)')
+        offset_row.set_subtitle('±ms added randomly to each delay  •  0 = disabled')
+        self._offset_spin = Gtk.SpinButton()
+        self._offset_spin.set_adjustment(
+            Gtk.Adjustment(value=cfg.get('offset', 0), lower=0, upper=10000, step_increment=100))
+        self._offset_spin.set_width_chars(7)
+        self._offset_spin.set_valign(Gtk.Align.CENTER)
+        offset_row.add_suffix(self._offset_spin)
+
+        group.add(delay_row)
+        group.add(offset_row)
+        return group
+
+    def _build_count_section(self) -> Gtk.Widget:
+        group = Adw.PreferencesGroup()
+        group.set_title('Click Count')
+
+        count_row = Adw.ActionRow()
+        count_row.set_title('Repeat count')
+        count_row.set_subtitle('0 = click indefinitely')
+        self._count_spin = Gtk.SpinButton()
+        self._count_spin.set_adjustment(
+            Gtk.Adjustment(value=self.config.get('count', 0),
+                           lower=0, upper=999999, step_increment=1))
+        self._count_spin.set_width_chars(8)
+        self._count_spin.set_valign(Gtk.Align.CENTER)
+        count_row.add_suffix(self._count_spin)
+
+        group.add(count_row)
+        return group
+
+    def _build_hotkey_section(self) -> Gtk.Widget:
+        group = Adw.PreferencesGroup()
+        group.set_title('Hotkey')
+
+        row = Adw.ActionRow()
+        row.set_title('Start / Stop hotkey')
+        if not PYNPUT_AVAILABLE:
+            row.set_subtitle('Install pynput to trigger hotkeys')
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_box.set_valign(Gtk.Align.CENTER)
+
+        self._hotkey_label = Gtk.Label(
+            label=self.config.get('hotkey_display', 'Not set'))
+        self._hotkey_label.add_css_class('monospace')
+        self._hotkey_label.add_css_class('dim-label')
+
+        self._set_hotkey_btn = Gtk.Button(label='Set')
+        self._set_hotkey_btn.connect('clicked', self._on_record_hotkey)
+
+        self._clear_hotkey_btn = Gtk.Button(label='Clear')
+        self._clear_hotkey_btn.add_css_class('destructive-action')
+        self._clear_hotkey_btn.connect('clicked', self._on_clear_hotkey)
+
+        btn_box.append(self._hotkey_label)
+        btn_box.append(self._set_hotkey_btn)
+        btn_box.append(self._clear_hotkey_btn)
+        row.add_suffix(btn_box)
+        group.add(row)
+        return group
+
+    def _build_start_section(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        self._start_btn = Gtk.Button(label='Start')
+        self._start_btn.add_css_class('suggested-action')
+        self._start_btn.add_css_class('pill')
+        self._start_btn.set_hexpand(True)
+        self._start_btn.connect('clicked', self._on_start_stop)
+
+        self._status_label = Gtk.Label(label='Ready')
+        self._status_label.add_css_class('dim-label')
+
+        box.append(self._start_btn)
+        box.append(self._status_label)
+        return box
+
+    # ── Settings page ───────────────────────────────────────────────────────
+
+    def _build_settings_page(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        box.set_margin_top(24)
+        box.set_margin_bottom(24)
+        box.set_margin_start(24)
+        box.set_margin_end(24)
+
+        group = Adw.PreferencesGroup()
+        group.set_title('Appearance')
+        group.set_description('Choose how the application looks')
+
+        self._theme_combo = Adw.ComboRow()
+        self._theme_combo.set_title('Theme')
+        self._theme_combo.set_model(Gtk.StringList.new(['System', 'Light', 'Dark']))
+        self._theme_combo.set_selected(
+            {'system': 0, 'light': 1, 'dark': 2}.get(self.config.get('theme', 'system'), 0))
+        self._theme_combo.connect('notify::selected', self._on_theme_changed)
+
+        group.add(self._theme_combo)
+        box.append(group)
+        return box
+
+    # ── Theme ───────────────────────────────────────────────────────────────
+
+    def _apply_theme(self, theme: str):
+        scheme = {
+            'light': Adw.ColorScheme.FORCE_LIGHT,
+            'dark':  Adw.ColorScheme.FORCE_DARK,
+        }.get(theme, Adw.ColorScheme.DEFAULT)
+        self.get_application().get_style_manager().set_color_scheme(scheme)
+
+        self.config['theme'] = theme
+        self._save_config()
+
+    def _on_theme_changed(self, row, _param):
+        self._apply_theme(['system', 'light', 'dark'][row.get_selected()])
+
+    # ── Get Position ────────────────────────────────────────────────────────
+
+    def _on_get_position(self, _btn):
+        self._get_btn.set_label('Capturing…')
+        self._get_btn.set_sensitive(False)
+
+        overlay = Gtk.Window(application=self.get_application())
+        overlay.set_decorated(False)
+        overlay.fullscreen()
+        overlay.set_cursor_from_name('crosshair')
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+
+        heading = Gtk.Label(label='Click anywhere to capture position')
+        heading.add_css_class('title-1')
+        sub = Gtk.Label(label='Escape to cancel')
+        sub.add_css_class('dim-label')
+        box.append(heading)
+        box.append(sub)
+        overlay.set_child(box)
+
+        captured = {'done': False}
+
+        click_ctrl = Gtk.GestureClick()
+        def on_pressed(gesture, _n, x, y):
+            captured['done'] = True
+            scale = overlay.get_scale_factor()
+            overlay.close()
+            GLib.idle_add(self._position_captured, int(x * scale), int(y * scale))
+        click_ctrl.connect('pressed', on_pressed)
+        overlay.add_controller(click_ctrl)
+
+        key_ctrl = Gtk.EventControllerKey()
+        def on_key(_ctrl, keyval, _code, _state):
+            if keyval == Gdk.KEY_Escape:
+                overlay.close()
+                return True
+        key_ctrl.connect('key-pressed', on_key)
+        overlay.add_controller(key_ctrl)
+
+        def on_close_request(_win):
+            if not captured['done']:
+                self._get_btn.set_label('Get Position')
+                self._get_btn.set_sensitive(True)
+            return False
+
+        overlay.connect('close-request', on_close_request)
+        overlay.present()
+
+    def _position_captured(self, x: int, y: int) -> bool:
+        self._x_spin.set_value(x)
+        self._y_spin.set_value(y)
+        self._get_btn.set_label('Get Position')
+        self._get_btn.set_sensitive(True)
+        return False
+
+    # ── Hotkey Recording ────────────────────────────────────────────────────
+
+    def _on_record_hotkey(self, _btn):
+        """Show a dialog and capture the next key combo via GTK event controller.
+        This reliably catches bare F-keys that pynput's Listener can miss on Wayland."""
+        recorded: dict = {}
+
+        dialog = Adw.AlertDialog()
+        dialog.set_heading('Set Hotkey')
+        dialog.set_body('Press any key or combination…\n\nEsc to cancel.')
+        dialog.add_response('cancel', 'Cancel')
+
+        key_ctrl = Gtk.EventControllerKey()
+        key_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+        def on_key_pressed(_ctrl, keyval, _keycode, state):
+            if keyval in _MODIFIER_KEYSYMS:
+                return False                        # let modifier-only through unhandled
+            if keyval == Gdk.KEY_Escape:
+                dialog.close()
+                return True
+
+            hotkey, display = _gdk_to_pynput(keyval, state)
+            recorded['hotkey']  = hotkey
+            recorded['display'] = display
+            dialog.close()
+            return True
+
+        key_ctrl.connect('key-pressed', on_key_pressed)
+        dialog.add_controller(key_ctrl)
+
+        def on_closed(_dlg):
+            hotkey = recorded.get('hotkey')
+            if hotkey:
+                self.config['hotkey']         = hotkey
+                self.config['hotkey_display'] = recorded['display']
+                self._save_config()
+                self._hotkey_label.set_label(recorded['display'])
+                self._setup_hotkey()
+
+        dialog.connect('closed', on_closed)
+        dialog.present(self)
+
+    def _on_clear_hotkey(self, _btn):
+        self.config.pop('hotkey', None)
+        self.config.pop('hotkey_display', None)
+        self._save_config()
+        self._hotkey_label.set_label('Not set')
+        if self.hotkey_listener:
+            self.hotkey_listener.stop()
+            self.hotkey_listener = None
+
+    def _setup_hotkey(self):
+        if self.hotkey_listener:
+            self.hotkey_listener.stop()
+            self.hotkey_listener = None
+
+        hotkey_str = self.config.get('hotkey')
+        if not hotkey_str or not PYNPUT_AVAILABLE:
+            return
+
+        # Split '<ctrl>+<f6>' → {'<ctrl>', '<f6>'}
+        target: set[str] = set(hotkey_str.split('+'))
+        pressed: set[str] = set()
+        fired = False
+
+        def on_press(key):
+            nonlocal fired
+            token = _normalize_pynput_key(key)
+            print(f'[hotkey] press {key!r} → {token!r}  pressed={pressed}  target={target}', file=sys.stderr)
+            if not token:
+                return
+            pressed.add(token)
+            if not fired and target <= pressed:
+                fired = True
+                GLib.idle_add(self._on_start_stop, None)
+
+        def on_release(key):
+            nonlocal fired
+            token = _normalize_pynput_key(key)
+            if token:
+                pressed.discard(token)
+            if fired and not (target <= pressed):
+                fired = False  # reset so the hotkey can fire again next press
+
+        try:
+            self.hotkey_listener = keyboard.Listener(
+                on_press=on_press, on_release=on_release)
+            self.hotkey_listener.daemon = True
+            self.hotkey_listener.start()
+            self.hotkey_listener.join(timeout=0.1)
+            if not self.hotkey_listener.is_alive():
+                self.hotkey_listener = None
+                print('Hotkey listener died immediately — check input group membership', file=sys.stderr)
+                GLib.idle_add(self._status_label.set_label,
+                              'Hotkey failed: add user to "input" group')
+            else:
+                print(f'Hotkey listener started for: {hotkey_str}', file=sys.stderr)
+        except Exception as exc:
+            print(f'Hotkey setup failed: {exc}', file=sys.stderr)
+
+    # ── Click loop ──────────────────────────────────────────────────────────
+
+    def _on_start_stop(self, _btn):
+        if self.clicking:
+            self._stop_clicking()
+        else:
+            self._start_clicking()
+
+    def _start_clicking(self):
+        self.clicking = True
+        self.stop_event.clear()
+        self._start_btn.set_label('Stop')
+        self._start_btn.remove_css_class('suggested-action')
+        self._start_btn.add_css_class('destructive-action')
+
+        button_code = BUTTON_CODES[BUTTON_LABELS[self._button_combo.get_selected()]]
+        delay_ms    = self._delay_spin.get_value()
+        offset_ms   = self._offset_spin.get_value()
+        count       = int(self._count_spin.get_value())
+        use_fixed   = self._fixed_radio.get_active()
+        x           = int(self._x_spin.get_value())
+        y           = int(self._y_spin.get_value())
+
+        self.click_thread = threading.Thread(
+            target=self._click_loop,
+            args=(button_code, delay_ms, offset_ms, count, use_fixed, x, y),
+            daemon=True,
+        )
+        self.click_thread.start()
+
+    def _stop_clicking(self):
+        self.clicking = False
+        self.stop_event.set()
+        self._start_btn.set_label('Start')
+        self._start_btn.remove_css_class('destructive-action')
+        self._start_btn.add_css_class('suggested-action')
+        GLib.idle_add(self._status_label.set_label, 'Ready')
+
+    def _click_loop(self, button_code, delay_ms, offset_ms, count, use_fixed, x, y):
+        clicks_done = 0
+
+        while not self.stop_event.is_set():
+            if count > 0 and clicks_done >= count:
+                GLib.idle_add(self._stop_clicking)
+                break
+
+            try:
+                if use_fixed:
+                    # ydotool mousemove is relative — reset to origin then move to target
+                    subprocess.run(
+                        ['ydotool', 'mousemove', '--', '-99999', '-99999'],
+                        check=True, capture_output=True)
+                    subprocess.run(
+                        ['ydotool', 'mousemove', '--', str(x), str(y)],
+                        check=True, capture_output=True)
+
+                subprocess.run(
+                    ['ydotool', 'click', button_code],
+                    check=True, capture_output=True)
+
+            except subprocess.CalledProcessError as exc:
+                err = exc.stderr.decode().strip() if exc.stderr else str(exc)
+                GLib.idle_add(self._status_label.set_label, f'Error: {err}')
+                GLib.idle_add(self._stop_clicking)
+                break
+
+            clicks_done += 1
+            label = (f'Clicking… ({clicks_done})'
+                     if count == 0 else
+                     f'Clicking… ({clicks_done} / {count})')
+            GLib.idle_add(self._status_label.set_label, label)
+
+            sleep_ms = delay_ms
+            if offset_ms > 0:
+                sleep_ms += random.uniform(-offset_ms, offset_ms)
+            self.stop_event.wait(max(1.0, sleep_ms) / 1000.0)
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _on_close_request(self, _win) -> bool:
+        self._save_all_settings()
+        return False  # allow the window to close
+
+    def _save_all_settings(self):
+        self.config['button'] = self._button_combo.get_selected()
+        self.config['delay']  = self._delay_spin.get_value()
+        self.config['offset'] = self._offset_spin.get_value()
+        self.config['count']  = int(self._count_spin.get_value())
+        self.config['target'] = 'fixed' if self._fixed_radio.get_active() else 'current'
+        self.config['x']      = int(self._x_spin.get_value())
+        self.config['y']      = int(self._y_spin.get_value())
+        self._save_config()
+
+    # ── Daemon help dialog ──────────────────────────────────────────────────
+
+    def _on_daemon_help(self, _banner):
+        dialog = Adw.AlertDialog()
+        dialog.set_heading('Starting ydotoold')
+        dialog.set_body(
+            'Run the following command in a terminal to start the ydotoold daemon:\n\n'
+            '    ydotoold &\n\n'
+            'To start it automatically on login, add it to your session startup '
+            'or create a systemd user service.\n\n'
+            'You may also need to be in the "input" group:\n\n'
+            '    sudo usermod -aG input $USER\n\n'
+            'Then log out and back in.'
+        )
+        dialog.add_response('ok', 'OK')
+        dialog.present(self)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────
+
+def main():
+    _ensure_ydotoold()
+    app = ClickerApp()
+    try:
+        return app.run(sys.argv)
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
