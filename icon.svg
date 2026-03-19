@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#29b6f6"/>
+      <stop offset="100%" stop-color="#0277bd"/>
+    </linearGradient>
+    <linearGradient id="mouse-body" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#e3f2fd"/>
+    </linearGradient>
+    <linearGradient id="wheel" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#81d4fa"/>
+      <stop offset="100%" stop-color="#4fc3f7"/>
+    </linearGradient>
+    <clipPath id="mouse-clip">
+      <rect x="39" y="17" width="50" height="78" rx="25"/>
+    </clipPath>
+  </defs>
+
+  <!-- Background -->
+  <rect width="128" height="128" rx="22" fill="url(#bg)"/>
+
+  <!-- Click ripples (centered on mouse) -->
+  <circle cx="64" cy="56" r="40" fill="none" stroke="white" stroke-width="2.5" opacity="0.18"/>
+  <circle cx="64" cy="56" r="52" fill="none" stroke="white" stroke-width="1.5" opacity="0.10"/>
+
+  <!-- Mouse shadow -->
+  <rect x="41" y="21" width="50" height="78" rx="25" fill="black" opacity="0.15"/>
+
+  <!-- Mouse body -->
+  <rect x="39" y="17" width="50" height="78" rx="25" fill="url(#mouse-body)"/>
+
+  <!-- Left button pressed highlight -->
+  <rect x="39" y="17" width="25" height="40" fill="#29b6f6" opacity="0.28"
+        clip-path="url(#mouse-clip)"/>
+
+  <!-- Button divider — vertical -->
+  <line x1="64" y1="17" x2="64" y2="57" stroke="#90caf9" stroke-width="1.5"/>
+
+  <!-- Button divider — horizontal -->
+  <line x1="40" y1="57" x2="88" y2="57" stroke="#90caf9" stroke-width="1.5"/>
+
+  <!-- Scroll wheel -->
+  <rect x="59.5" y="27" width="9" height="22" rx="4.5" fill="url(#wheel)"/>
+  <!-- Wheel sheen -->
+  <rect x="60.5" y="28" width="3.5" height="8" rx="1.75" fill="white" opacity="0.55"/>
+
+  <!-- Three click dots at the bottom to convey auto-clicking -->
+  <circle cx="52" cy="108" r="4"  fill="white" opacity="0.90"/>
+  <circle cx="64" cy="112" r="4"  fill="white" opacity="0.65"/>
+  <circle cx="76" cy="108" r="4"  fill="white" opacity="0.40"/>
+</svg>

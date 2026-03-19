@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Auto Clicker
+Comment=Mouse automation tool
+Exec=python3 /home/ryanford/Documents/src/clicker/main.py
+Icon=io.github.clicker
+Type=Application
+Categories=Utility;
+StartupWMClass=io.github.clicker
+StartupNotify=true

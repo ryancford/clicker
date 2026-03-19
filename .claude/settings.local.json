@@ -15,7 +15,22 @@
       "Bash(echo $WAYLAND_DISPLAY)",
       "Bash(echo $DISPLAY)",
       "Bash(echo \"exit: $?\")",
-      "Bash(dpkg -l python3-evdev)"
+      "Bash(dpkg -l python3-evdev)",
+      "Bash(gdbus call:*)",
+      "Bash(find ~/.config/cosmic/ -name *.ron)",
+      "Bash(pkg-config --modversion libadwaita-1)",
+      "Bash(xargs cat:*)",
+      "Bash(gdbus introspect:*)",
+      "Bash(echo \"GTK_THEME=$GTK_THEME\")",
+      "Bash(gsettings get:*)",
+      "Read(//usr/share/themes/**)",
+      "Read(//home/ryanford/.local/share/**)",
+      "Bash(ls /home/ryanford/Documents/src/clicker/*.svg /home/ryanford/Documents/src/clicker/*.png)",
+      "Bash(install -Dm644 /home/ryanford/Documents/src/clicker/icon.svg ~/.local/share/icons/hicolor/scalable/apps/io.github.clicker.svg)",
+      "Bash(gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor)",
+      "Bash(ls:*)",
+      "Bash(install -Dm644 /home/ryanford/Documents/src/clicker/io.github.clicker.desktop ~/.local/share/applications/io.github.clicker.desktop)",
+      "Bash(update-desktop-database ~/.local/share/applications/)"
     ]
   }
 }

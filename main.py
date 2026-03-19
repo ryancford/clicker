@@ -5,7 +5,7 @@ import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 gi.require_version('Gdk', '4.0')
-from gi.repository import Gtk, Adw, Gdk, GLib
+from gi.repository import Gtk, Adw, Gdk, GLib, Gio
 
 import json
 import os
@@ -183,15 +183,20 @@ class MainWindow(Adw.ApplicationWindow):
         super().__init__(**kwargs)
         self.set_title('Auto Clicker')
         self.set_default_size(480, 720)
+        self.set_icon_name('io.github.clicker')
 
         self.clicking      = False
         self.stop_event    = threading.Event()
         self.click_thread: threading.Thread | None = None
         self._hotkey_stop: threading.Event | None = None
+        self._portal_conn = None
+        self._portal_sub_id = None
+        self._theme_monitor = None
 
         self.config = self._load_config()
         self._build_ui()
         self._apply_theme(self.config.get('theme', 'system'))
+        self._theme_combo.connect('notify::selected', self._on_theme_changed)
         self._setup_hotkey()
         self.connect('close-request', self._on_close_request)
 
@@ -454,8 +459,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._theme_combo.set_model(Gtk.StringList.new(['System', 'Light', 'Dark']))
         self._theme_combo.set_selected(
             {'system': 0, 'light': 1, 'dark': 2}.get(self.config.get('theme', 'system'), 0))
-        self._theme_combo.connect('notify::selected', self._on_theme_changed)
-
         group.add(self._theme_combo)
         box.append(group)
         return box
@@ -463,17 +466,112 @@ class MainWindow(Adw.ApplicationWindow):
     # ── Theme ───────────────────────────────────────────────────────────────
 
     def _apply_theme(self, theme: str):
-        scheme = {
-            'light': Adw.ColorScheme.FORCE_LIGHT,
-            'dark':  Adw.ColorScheme.FORCE_DARK,
-        }.get(theme, Adw.ColorScheme.DEFAULT)
+        self._disconnect_portal()
+        if theme == 'system':
+            self._connect_portal_theme()
+        else:
+            scheme = (Adw.ColorScheme.FORCE_LIGHT if theme == 'light'
+                      else Adw.ColorScheme.FORCE_DARK)
+            self.get_application().get_style_manager().set_color_scheme(scheme)
+
+    def _connect_portal_theme(self):
+        """Query XDG portal for current color-scheme and watch COSMIC config for changes.
+
+        COSMIC's portal implements Settings.Read correctly but does not emit SettingChanged,
+        so we fall back to watching the COSMIC theme-mode config directory directly.
+        """
+        try:
+            conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            self._portal_conn = conn
+            self._reread_portal_scheme()
+
+            # Subscribe to SettingChanged in case a future COSMIC version sends it
+            self._portal_sub_id = conn.signal_subscribe(
+                'org.freedesktop.portal.Desktop',
+                'org.freedesktop.portal.Settings',
+                'SettingChanged',
+                '/org/freedesktop/portal/desktop',
+                None,
+                Gio.DBusSignalFlags.NONE,
+                self._on_portal_setting_changed,
+            )
+        except Exception as exc:
+            print(f'Portal theme detection failed: {exc}', file=sys.stderr)
+            self.get_application().get_style_manager().set_color_scheme(Adw.ColorScheme.DEFAULT)
+            return
+
+        # Watch the COSMIC theme-mode config directory — COSMIC writes a file here
+        # when the user changes the dark/light setting
+        mode_dir = Path.home() / '.config/cosmic/com.system76.CosmicTheme.Mode/v1'
+        mode_dir.mkdir(parents=True, exist_ok=True)
+        gfile = Gio.File.new_for_path(str(mode_dir))
+        self._theme_monitor = gfile.monitor_directory(Gio.FileMonitorFlags.NONE, None)
+        self._theme_monitor.connect('changed', self._on_cosmic_theme_dir_changed)
+        print('Watching COSMIC theme config:', mode_dir, file=sys.stderr)
+
+    def _reread_portal_scheme(self):
+        """Re-query the portal and apply the current color-scheme. Safe to call any time."""
+        try:
+            result = self._portal_conn.call_sync(
+                'org.freedesktop.portal.Desktop',
+                '/org/freedesktop/portal/desktop',
+                'org.freedesktop.portal.Settings',
+                'Read',
+                GLib.Variant('(ss)', ('org.freedesktop.appearance', 'color-scheme')),
+                GLib.VariantType('(v)'),
+                Gio.DBusCallFlags.NONE, -1, None,
+            )
+            v = result.get_child_value(0)
+            while v.get_type_string() == 'v':
+                v = v.get_variant()
+            val = v.get_uint32()
+            print(f'Portal color-scheme: {val}', file=sys.stderr)
+            self._apply_portal_color_scheme(val)
+        except Exception as exc:
+            print(f'Portal re-read failed: {exc}', file=sys.stderr)
+        return False  # for GLib.idle_add compatibility
+
+    def _on_cosmic_theme_dir_changed(self, monitor, gfile, _other, event_type):
+        if event_type in (Gio.FileMonitorEvent.CREATED,
+                          Gio.FileMonitorEvent.CHANGED,
+                          Gio.FileMonitorEvent.DELETED,
+                          Gio.FileMonitorEvent.RENAMED):
+            print(f'COSMIC theme dir changed ({event_type.value_nick}), re-reading portal',
+                  file=sys.stderr)
+            GLib.idle_add(self._reread_portal_scheme)
+
+    def _apply_portal_color_scheme(self, val: int):
+        # XDG spec: 0 = no preference, 1 = prefer dark, 2 = prefer light
+        scheme = Adw.ColorScheme.FORCE_DARK if val == 1 else Adw.ColorScheme.FORCE_LIGHT
         self.get_application().get_style_manager().set_color_scheme(scheme)
 
-        self.config['theme'] = theme
-        self._save_config()
+    def _on_portal_setting_changed(self, conn, sender, path, iface, signal, params, _data):
+        try:
+            namespace = params.get_child_value(0).get_string()
+            key       = params.get_child_value(1).get_string()
+            if namespace == 'org.freedesktop.appearance' and key == 'color-scheme':
+                v = params.get_child_value(2)
+                while v.get_type_string() == 'v':
+                    v = v.get_variant()
+                val = v.get_uint32()
+                GLib.idle_add(self._apply_portal_color_scheme, val)
+        except Exception as exc:
+            print(f'Portal SettingChanged error: {exc}', file=sys.stderr)
+
+    def _disconnect_portal(self):
+        if self._portal_conn and self._portal_sub_id is not None:
+            self._portal_conn.signal_unsubscribe(self._portal_sub_id)
+        self._portal_sub_id = None
+        self._portal_conn = None
+        if self._theme_monitor:
+            self._theme_monitor.cancel()
+            self._theme_monitor = None
 
     def _on_theme_changed(self, row, _param):
-        self._apply_theme(['system', 'light', 'dark'][row.get_selected()])
+        theme = ['system', 'light', 'dark'][row.get_selected()]
+        self._apply_theme(theme)
+        self.config['theme'] = theme
+        self._save_config()
 
     # ── Get Position ────────────────────────────────────────────────────────
 
@@ -737,6 +835,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_close_request(self, _win) -> bool:
         self._stop_hotkey_listener()
+        self._disconnect_portal()
         self._save_all_settings()
         return False  # allow the window to close
 
