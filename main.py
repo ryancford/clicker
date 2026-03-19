@@ -10,20 +10,18 @@ from gi.repository import Gtk, Adw, Gdk, GLib
 import json
 import os
 import random
+import select
 import subprocess
 import sys
 import threading
 from pathlib import Path
 
-# Force pynput to use the evdev backend so keyboard events are read directly
-# from /dev/input/event* rather than via XRecord (which misses Wayland windows).
-os.environ['PYNPUT_BACKEND'] = 'evdev'
-
 try:
-    from pynput import keyboard
-    PYNPUT_AVAILABLE = True
+    import evdev
+    from evdev import ecodes
+    EVDEV_AVAILABLE = True
 except ImportError:
-    PYNPUT_AVAILABLE = False
+    EVDEV_AVAILABLE = False
 
 CONFIG_PATH = Path.home() / '.config' / 'clicker' / 'config.json'
 
@@ -39,6 +37,56 @@ _MODIFIER_KEYSYMS = frozenset([
     Gdk.KEY_ISO_Level3_Shift,
     Gdk.KEY_Caps_Lock, Gdk.KEY_Num_Lock, Gdk.KEY_Scroll_Lock,
 ])
+
+# GDK key name → evdev KEY_* name
+_GDK_NAME_TO_EVDEV: dict[str, str] = {
+    **{chr(c): f'KEY_{chr(c).upper()}' for c in range(ord('a'), ord('z') + 1)},
+    **{f'F{i}': f'KEY_F{i}' for i in range(1, 13)},
+    **{str(i): f'KEY_{i}' for i in range(10)},
+    'Return':      'KEY_ENTER',
+    'KP_Enter':    'KEY_KPENTER',
+    'Tab':         'KEY_TAB',
+    'space':       'KEY_SPACE',
+    'BackSpace':   'KEY_BACKSPACE',
+    'Escape':      'KEY_ESC',
+    'Delete':      'KEY_DELETE',
+    'Insert':      'KEY_INSERT',
+    'Home':        'KEY_HOME',
+    'End':         'KEY_END',
+    'Page_Up':     'KEY_PAGEUP',
+    'Page_Down':   'KEY_PAGEDOWN',
+    'Left':        'KEY_LEFT',
+    'Right':       'KEY_RIGHT',
+    'Up':          'KEY_UP',
+    'Down':        'KEY_DOWN',
+    'Print':       'KEY_SYSRQ',
+    'Pause':       'KEY_PAUSE',
+    'minus':       'KEY_MINUS',
+    'equal':       'KEY_EQUAL',
+    'bracketleft': 'KEY_LEFTBRACE',
+    'bracketright':'KEY_RIGHTBRACE',
+    'semicolon':   'KEY_SEMICOLON',
+    'apostrophe':  'KEY_APOSTROPHE',
+    'grave':       'KEY_GRAVE',
+    'backslash':   'KEY_BACKSLASH',
+    'comma':       'KEY_COMMA',
+    'period':      'KEY_DOT',
+    'slash':       'KEY_SLASH',
+}
+
+# evdev key code → canonical modifier token
+_EVDEV_MOD_CODES: dict[int, str] = {}
+if EVDEV_AVAILABLE:
+    _EVDEV_MOD_CODES = {
+        ecodes.KEY_LEFTCTRL:  'ctrl',
+        ecodes.KEY_RIGHTCTRL: 'ctrl',
+        ecodes.KEY_LEFTALT:   'alt',
+        ecodes.KEY_RIGHTALT:  'alt',
+        ecodes.KEY_LEFTSHIFT: 'shift',
+        ecodes.KEY_RIGHTSHIFT:'shift',
+        ecodes.KEY_LEFTMETA:  'super',
+        ecodes.KEY_RIGHTMETA: 'super',
+    }
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -65,49 +113,44 @@ def _ensure_ydotoold() -> bool:
         return False
 
 
-def _normalize_pynput_key(key) -> str | None:
-    """Normalize a pynput key to the same token format produced by _gdk_to_pynput."""
-    try:
-        name = key.name
-        for suffix in ('_l', '_r'):
-            if name.endswith(suffix):
-                name = name[:-len(suffix)]
-                break
-        return f'<{name}>'
-    except AttributeError:
-        char = getattr(key, 'char', None)
-        return char.lower() if char else None
+def _gdk_to_hotkey(keyval: int, state: Gdk.ModifierType) -> tuple[str, str]:
+    """Return (hotkey_string, human_display_string) from a GTK key event.
 
-
-def _gdk_to_pynput(keyval: int, state: Gdk.ModifierType) -> tuple[str, str]:
-    """Return (pynput_hotkey_string, human_display_string) from a GTK key event."""
+    hotkey_string tokens are separated by '+':
+      modifier tokens : 'ctrl', 'alt', 'shift', 'super'
+      key tokens      : evdev KEY_* names, e.g. 'KEY_F6', 'KEY_A'
+    """
     parts: list[str] = []
     display: list[str] = []
 
     if state & Gdk.ModifierType.CONTROL_MASK:
-        parts.append('<ctrl>')
-        display.append('Ctrl')
+        parts.append('ctrl');  display.append('Ctrl')
     if state & Gdk.ModifierType.ALT_MASK:
-        parts.append('<alt>')
-        display.append('Alt')
+        parts.append('alt');   display.append('Alt')
     if state & Gdk.ModifierType.SUPER_MASK:
-        parts.append('<super>')
-        display.append('Super')
+        parts.append('super'); display.append('Super')
     if state & Gdk.ModifierType.SHIFT_MASK:
-        parts.append('<shift>')
-        display.append('Shift')
+        parts.append('shift'); display.append('Shift')
 
     name = Gdk.keyval_name(keyval) or ''
-    if len(name) == 1:
-        # Regular printable key — pynput uses bare char, no angle brackets
-        parts.append(name.lower())
-        display.append(name.upper())
-    else:
-        # Special key (F1-F12, Return, Tab, space, …)
-        parts.append(f'<{name.lower()}>')
-        display.append(name)          # keep original case for readability
+    evdev_name = _GDK_NAME_TO_EVDEV.get(name, f'KEY_{name.upper()}')
+    parts.append(evdev_name)
+    display.append(name if len(name) > 1 else name.upper())
 
     return '+'.join(parts), ' + '.join(display)
+
+
+def _evdev_keyboards() -> list:
+    """Return all readable evdev InputDevice objects that can produce EV_KEY events."""
+    devices = []
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+            if ecodes.EV_KEY in dev.capabilities():
+                devices.append(dev)
+        except Exception:
+            pass
+    return devices
 
 
 # ── Application ────────────────────────────────────────────────────────────
@@ -141,11 +184,10 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_title('Auto Clicker')
         self.set_default_size(480, 720)
 
-        self.clicking       = False
-        self.stop_event     = threading.Event()
+        self.clicking      = False
+        self.stop_event    = threading.Event()
         self.click_thread: threading.Thread | None = None
-        self.hotkey_listener  = None
-        self.position_listener = None
+        self._hotkey_stop: threading.Event | None = None
 
         self.config = self._load_config()
         self._build_ui()
@@ -353,8 +395,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         row = Adw.ActionRow()
         row.set_title('Start / Stop hotkey')
-        if not PYNPUT_AVAILABLE:
-            row.set_subtitle('Install pynput to trigger hotkeys')
+        if not EVDEV_AVAILABLE:
+            row.set_subtitle('Install python3-evdev to enable hotkeys')
 
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btn_box.set_valign(Gtk.Align.CENTER)
@@ -494,8 +536,7 @@ class MainWindow(Adw.ApplicationWindow):
     # ── Hotkey Recording ────────────────────────────────────────────────────
 
     def _on_record_hotkey(self, _btn):
-        """Show a dialog and capture the next key combo via GTK event controller.
-        This reliably catches bare F-keys that pynput's Listener can miss on Wayland."""
+        """Show a dialog and capture the next key combo via GTK event controller."""
         recorded: dict = {}
 
         dialog = Adw.AlertDialog()
@@ -508,12 +549,12 @@ class MainWindow(Adw.ApplicationWindow):
 
         def on_key_pressed(_ctrl, keyval, _keycode, state):
             if keyval in _MODIFIER_KEYSYMS:
-                return False                        # let modifier-only through unhandled
+                return False
             if keyval == Gdk.KEY_Escape:
                 dialog.close()
                 return True
 
-            hotkey, display = _gdk_to_pynput(keyval, state)
+            hotkey, display = _gdk_to_hotkey(keyval, state)
             recorded['hotkey']  = hotkey
             recorded['display'] = display
             dialog.close()
@@ -539,58 +580,81 @@ class MainWindow(Adw.ApplicationWindow):
         self.config.pop('hotkey_display', None)
         self._save_config()
         self._hotkey_label.set_label('Not set')
-        if self.hotkey_listener:
-            self.hotkey_listener.stop()
-            self.hotkey_listener = None
+        self._stop_hotkey_listener()
+
+    # ── Hotkey Listener (evdev) ─────────────────────────────────────────────
+
+    def _stop_hotkey_listener(self):
+        if self._hotkey_stop:
+            self._hotkey_stop.set()
+            self._hotkey_stop = None
 
     def _setup_hotkey(self):
-        if self.hotkey_listener:
-            self.hotkey_listener.stop()
-            self.hotkey_listener = None
+        self._stop_hotkey_listener()
 
         hotkey_str = self.config.get('hotkey')
-        if not hotkey_str or not PYNPUT_AVAILABLE:
+        if not hotkey_str or not EVDEV_AVAILABLE:
             return
 
-        # Split '<ctrl>+<f6>' → {'<ctrl>', '<f6>'}
         target: set[str] = set(hotkey_str.split('+'))
-        pressed: set[str] = set()
-        fired = False
+        stop = threading.Event()
+        self._hotkey_stop = stop
 
-        def on_press(key):
-            nonlocal fired
-            token = _normalize_pynput_key(key)
-            print(f'[hotkey] press {key!r} → {token!r}  pressed={pressed}  target={target}', file=sys.stderr)
-            if not token:
-                return
-            pressed.add(token)
-            if not fired and target <= pressed:
-                fired = True
-                GLib.idle_add(self._on_start_stop, None)
-
-        def on_release(key):
-            nonlocal fired
-            token = _normalize_pynput_key(key)
-            if token:
-                pressed.discard(token)
-            if fired and not (target <= pressed):
-                fired = False  # reset so the hotkey can fire again next press
-
-        try:
-            self.hotkey_listener = keyboard.Listener(
-                on_press=on_press, on_release=on_release)
-            self.hotkey_listener.daemon = True
-            self.hotkey_listener.start()
-            self.hotkey_listener.join(timeout=0.1)
-            if not self.hotkey_listener.is_alive():
-                self.hotkey_listener = None
-                print('Hotkey listener died immediately — check input group membership', file=sys.stderr)
+        def listener():
+            devices = _evdev_keyboards()
+            if not devices:
+                print('evdev: no keyboard devices found', file=sys.stderr)
                 GLib.idle_add(self._status_label.set_label,
-                              'Hotkey failed: add user to "input" group')
-            else:
-                print(f'Hotkey listener started for: {hotkey_str}', file=sys.stderr)
-        except Exception as exc:
-            print(f'Hotkey setup failed: {exc}', file=sys.stderr)
+                              'Hotkey failed: no input devices (check input group)')
+                return
+
+            print(f'evdev hotkey listener started for: {hotkey_str} '
+                  f'on {len(devices)} device(s)', file=sys.stderr)
+
+            pressed: set[str] = set()
+            fired = False
+
+            while not stop.is_set():
+                try:
+                    r, _, _ = select.select(devices, [], [], 0.05)
+                except (ValueError, OSError):
+                    break
+                for dev in r:
+                    try:
+                        for event in dev.read():
+                            if event.type != ecodes.EV_KEY:
+                                continue
+                            # Translate code → canonical token
+                            token = _EVDEV_MOD_CODES.get(event.code)
+                            if token is None:
+                                names = ecodes.KEY.get(event.code, '')
+                                token = (names[0] if isinstance(names, list)
+                                         else names) or None
+                            if not token:
+                                continue
+
+                            if event.value == 1:       # key down
+                                pressed.add(token)
+                                print(f'[hotkey] ↓ {token}  pressed={pressed}  target={target}',
+                                      file=sys.stderr)
+                                if not fired and target <= pressed:
+                                    fired = True
+                                    GLib.idle_add(self._on_start_stop, None)
+                            elif event.value == 0:     # key up
+                                pressed.discard(token)
+                                if fired and not (target <= pressed):
+                                    fired = False
+                    except OSError:
+                        pass
+
+            for dev in devices:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=listener, daemon=True)
+        t.start()
 
     # ── Click loop ──────────────────────────────────────────────────────────
 
@@ -672,6 +736,7 @@ class MainWindow(Adw.ApplicationWindow):
     # ── Helpers ─────────────────────────────────────────────────────────────
 
     def _on_close_request(self, _win) -> bool:
+        self._stop_hotkey_listener()
         self._save_all_settings()
         return False  # allow the window to close
 
