@@ -30,7 +30,12 @@
       "Bash(gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor)",
       "Bash(ls:*)",
       "Bash(install -Dm644 /home/ryanford/Documents/src/clicker/io.github.clicker.desktop ~/.local/share/applications/io.github.clicker.desktop)",
-      "Bash(update-desktop-database ~/.local/share/applications/)"
+      "Bash(update-desktop-database ~/.local/share/applications/)",
+      "Bash(pkill -x ydotool)",
+      "Bash(pkill -x ydotoold)",
+      "Bash(ydotool - --help)",
+      "Bash(ydotool help:*)",
+      "Bash(ydotool --help)"
     ]
   }
 }

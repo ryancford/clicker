@@ -20,13 +20,18 @@ try:
     import evdev
     from evdev import ecodes
     EVDEV_AVAILABLE = True
+    BUTTON_EVDEV = {
+        'Left':   ecodes.BTN_LEFT,
+        'Right':  ecodes.BTN_RIGHT,
+        'Middle': ecodes.BTN_MIDDLE,
+    }
 except ImportError:
     EVDEV_AVAILABLE = False
 
 CONFIG_PATH = Path.home() / '.config' / 'clicker' / 'config.json'
 
-BUTTON_CODES  = {'Left': '0xC0110', 'Right': '0xC0111', 'Middle': '0xC0112'}
 BUTTON_LABELS = ['Left', 'Right', 'Middle']
+BUTTON_EVDEV  = {}  # populated after evdev import check below
 
 # Pure-modifier keysyms — don't record these as hotkeys on their own
 _MODIFIER_KEYSYMS = frozenset([
@@ -104,6 +109,7 @@ def _ensure_ydotoold() -> bool:
         return True
     try:
         subprocess.Popen(['ydotoold'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        import time; time.sleep(0.2)  # brief wait for socket to be ready
         return True
     except FileNotFoundError:
         print('ydotoold not found — install ydotool', file=sys.stderr)
@@ -111,6 +117,26 @@ def _ensure_ydotoold() -> bool:
     except Exception as exc:
         print(f'Failed to start ydotoold: {exc}', file=sys.stderr)
         return False
+
+
+def _start_ydotoold_watchdog(banner) -> None:
+    """Daemon thread: keep ydotoold alive and sync the warning banner."""
+    import time
+
+    def _watchdog():
+        last_state = ydotoold_running()
+        while True:
+            time.sleep(5)
+            running = ydotoold_running()
+            if not running:
+                print('ydotoold died — restarting…', file=sys.stderr)
+                running = _ensure_ydotoold()
+            if running != last_state:
+                last_state = running
+                GLib.idle_add(banner.set_revealed, not running)
+
+    t = threading.Thread(target=_watchdog, daemon=True)
+    t.start()
 
 
 def _gdk_to_hotkey(keyval: int, state: Gdk.ModifierType) -> tuple[str, str]:
@@ -234,14 +260,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         toolbar_view.set_content(view_stack)
 
-        self._daemon_banner = Adw.Banner()
-        self._daemon_banner.set_title('ydotoold is not running — clicks may be slow or fail')
-        self._daemon_banner.set_button_label('How to fix')
-        self._daemon_banner.connect('button-clicked', self._on_daemon_help)
-        self._daemon_banner.set_revealed(not ydotoold_running())
-
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        outer.append(self._daemon_banner)
         outer.append(toolbar_view)
         toolbar_view.set_vexpand(True)
         self.set_content(outer)
@@ -769,7 +788,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._start_btn.remove_css_class('suggested-action')
         self._start_btn.add_css_class('destructive-action')
 
-        button_code = BUTTON_CODES[BUTTON_LABELS[self._button_combo.get_selected()]]
+        button_code = BUTTON_EVDEV.get(BUTTON_LABELS[self._button_combo.get_selected()],
+                                       ecodes.BTN_LEFT)
         delay_ms    = self._delay_spin.get_value()
         offset_ms   = self._offset_spin.get_value()
         count       = int(self._count_spin.get_value())
@@ -793,43 +813,63 @@ class MainWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._status_label.set_label, 'Ready')
 
     def _click_loop(self, button_code, delay_ms, offset_ms, count, use_fixed, x, y):
+        """Inject clicks directly via a single persistent UInput device.
+
+        One device is opened for the entire session — no per-click subprocess or
+        socket connection, so there is no fd churn in ydotoold (ydotoold not needed).
+        """
+        try:
+            ui = evdev.UInput(
+                {
+                    ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE],
+                    ecodes.EV_REL: [ecodes.REL_X, ecodes.REL_Y],
+                },
+                name='auto-clicker',
+            )
+        except Exception as exc:
+            GLib.idle_add(self._status_label.set_label, f'UInput error: {exc}')
+            GLib.idle_add(self._stop_clicking)
+            return
+
         clicks_done = 0
+        try:
+            while not self.stop_event.is_set():
+                if count > 0 and clicks_done >= count:
+                    GLib.idle_add(self._stop_clicking)
+                    break
 
-        while not self.stop_event.is_set():
-            if count > 0 and clicks_done >= count:
-                GLib.idle_add(self._stop_clicking)
-                break
+                try:
+                    if use_fixed:
+                        # Slam cursor to top-left then move to target
+                        ui.write(ecodes.EV_REL, ecodes.REL_X, -99999)
+                        ui.write(ecodes.EV_REL, ecodes.REL_Y, -99999)
+                        ui.syn()
+                        ui.write(ecodes.EV_REL, ecodes.REL_X, x)
+                        ui.write(ecodes.EV_REL, ecodes.REL_Y, y)
+                        ui.syn()
 
-            try:
-                if use_fixed:
-                    # ydotool mousemove is relative — reset to origin then move to target
-                    subprocess.run(
-                        ['ydotool', 'mousemove', '--', '-99999', '-99999'],
-                        check=True, capture_output=True)
-                    subprocess.run(
-                        ['ydotool', 'mousemove', '--', str(x), str(y)],
-                        check=True, capture_output=True)
+                    ui.write(ecodes.EV_KEY, button_code, 1)  # press
+                    ui.syn()
+                    ui.write(ecodes.EV_KEY, button_code, 0)  # release
+                    ui.syn()
 
-                subprocess.run(
-                    ['ydotool', 'click', button_code],
-                    check=True, capture_output=True)
+                except OSError as exc:
+                    GLib.idle_add(self._status_label.set_label, f'Input error: {exc}')
+                    GLib.idle_add(self._stop_clicking)
+                    break
 
-            except subprocess.CalledProcessError as exc:
-                err = exc.stderr.decode().strip() if exc.stderr else str(exc)
-                GLib.idle_add(self._status_label.set_label, f'Error: {err}')
-                GLib.idle_add(self._stop_clicking)
-                break
+                clicks_done += 1
+                label = (f'Clicking… ({clicks_done})'
+                         if count == 0 else
+                         f'Clicking… ({clicks_done} / {count})')
+                GLib.idle_add(self._status_label.set_label, label)
 
-            clicks_done += 1
-            label = (f'Clicking… ({clicks_done})'
-                     if count == 0 else
-                     f'Clicking… ({clicks_done} / {count})')
-            GLib.idle_add(self._status_label.set_label, label)
-
-            sleep_ms = delay_ms
-            if offset_ms > 0:
-                sleep_ms += random.uniform(-offset_ms, offset_ms)
-            self.stop_event.wait(max(1.0, sleep_ms) / 1000.0)
+                sleep_ms = delay_ms
+                if offset_ms > 0:
+                    sleep_ms += random.uniform(-offset_ms, offset_ms)
+                self.stop_event.wait(max(1.0, sleep_ms) / 1000.0)
+        finally:
+            ui.close()
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -851,26 +891,9 @@ class MainWindow(Adw.ApplicationWindow):
 
     # ── Daemon help dialog ──────────────────────────────────────────────────
 
-    def _on_daemon_help(self, _banner):
-        dialog = Adw.AlertDialog()
-        dialog.set_heading('Starting ydotoold')
-        dialog.set_body(
-            'Run the following command in a terminal to start the ydotoold daemon:\n\n'
-            '    ydotoold &\n\n'
-            'To start it automatically on login, add it to your session startup '
-            'or create a systemd user service.\n\n'
-            'You may also need to be in the "input" group:\n\n'
-            '    sudo usermod -aG input $USER\n\n'
-            'Then log out and back in.'
-        )
-        dialog.add_response('ok', 'OK')
-        dialog.present(self)
-
-
 # ── Entry point ────────────────────────────────────────────────────────────
 
 def main():
-    _ensure_ydotoold()
     app = ClickerApp()
     try:
         return app.run(sys.argv)
