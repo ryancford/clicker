@@ -893,7 +893,53 @@ class MainWindow(Adw.ApplicationWindow):
 
 # ── Entry point ────────────────────────────────────────────────────────────
 
+def _install_assets():
+    """Install icon and .desktop file to ~/.local/share on first run."""
+    here = Path(__file__).parent
+
+    targets = [
+        (here / 'icon.svg',
+         Path.home() / '.local/share/icons/hicolor/scalable/apps/io.github.clicker.svg'),
+    ]
+
+    desktop_src = here / 'io.github.clicker.desktop'
+    desktop_dst = Path.home() / '.local/share/applications/io.github.clicker.desktop'
+
+    installed = False
+    for src, dst in targets:
+        if src.exists() and not dst.exists():
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(src.read_bytes())
+                installed = True
+            except Exception as exc:
+                print(f'Could not install {dst.name}: {exc}', file=sys.stderr)
+
+    # Install .desktop with the correct absolute path to this script
+    if desktop_src.exists() and not desktop_dst.exists():
+        try:
+            desktop_dst.parent.mkdir(parents=True, exist_ok=True)
+            content = desktop_src.read_text().replace(
+                '__MAIN_PY__', str(here / 'main.py'))
+            desktop_dst.write_text(content)
+            installed = True
+        except Exception as exc:
+            print(f'Could not install desktop file: {exc}', file=sys.stderr)
+
+    if installed:
+        try:
+            subprocess.run(['update-desktop-database',
+                            str(Path.home() / '.local/share/applications')],
+                           capture_output=True)
+            subprocess.run(['gtk-update-icon-cache', '-f', '-t',
+                            str(Path.home() / '.local/share/icons/hicolor')],
+                           capture_output=True)
+        except Exception:
+            pass
+
+
 def main():
+    _install_assets()
     app = ClickerApp()
     try:
         return app.run(sys.argv)
