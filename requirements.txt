@@ -1,2 +1,2 @@
-# Install via:  sudo apt install python3-pynput
-pynput>=1.7
+# Install via:  sudo apt install python3-evdev
+evdev>=1.6
