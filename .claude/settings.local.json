@@ -35,7 +35,8 @@
       "Bash(pkill -x ydotoold)",
       "Bash(ydotool - --help)",
       "Bash(ydotool help:*)",
-      "Bash(ydotool --help)"
+      "Bash(ydotool --help)",
+      "Bash(git push:*)"
     ]
   }
 }
