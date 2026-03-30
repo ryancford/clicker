@@ -29,6 +29,10 @@ except ImportError:
     EVDEV_AVAILABLE = False
 
 CONFIG_PATH = Path.home() / '.config' / 'clicker' / 'config.json'
+_COSMIC_IS_DARK = (
+    Path.home() / '.config' / 'cosmic' /
+    'com.system76.CosmicTheme.Mode' / 'v1' / 'is_dark'
+)
 
 BUTTON_LABELS = ['Left', 'Right', 'Middle']
 BUTTON_EVDEV  = {}  # populated after evdev import check below
@@ -166,14 +170,26 @@ def _gdk_to_hotkey(keyval: int, state: Gdk.ModifierType) -> tuple[str, str]:
     return '+'.join(parts), ' + '.join(display)
 
 
+_KEYBOARD_REQUIRED_KEYS = frozenset({
+    ecodes.KEY_A, ecodes.KEY_Z, ecodes.KEY_SPACE,
+    ecodes.KEY_ENTER, ecodes.KEY_ESC, ecodes.KEY_LEFTSHIFT,
+})
+
 def _evdev_keyboards() -> list:
-    """Return all readable evdev InputDevice objects that can produce EV_KEY events."""
+    """Return evdev InputDevice objects for physical keyboards only.
+
+    Requires a core set of keyboard keys to exclude mice, touchpads,
+    gamepads, and minimal virtual devices created by the compositor.
+    """
     devices = []
     for path in evdev.list_devices():
         try:
             dev = evdev.InputDevice(path)
-            if ecodes.EV_KEY in dev.capabilities():
+            keys = set(dev.capabilities().get(ecodes.EV_KEY, []))
+            if _KEYBOARD_REQUIRED_KEYS.issubset(keys):
                 devices.append(dev)
+            else:
+                dev.close()
         except Exception:
             pass
     return devices
@@ -187,7 +203,7 @@ class ClickerApp(Adw.Application):
         self.connect('activate', self._on_activate)
 
     def _on_activate(self, app):
-        # Apply saved theme before the window is created so there is no flash
+        # Apply saved theme before the window is created to avoid a flash
         config = {}
         if CONFIG_PATH.exists():
             try:
@@ -195,11 +211,26 @@ class ClickerApp(Adw.Application):
             except Exception:
                 pass
         theme = config.get('theme', 'system')
-        scheme = {
-            'light': Adw.ColorScheme.FORCE_LIGHT,
-            'dark':  Adw.ColorScheme.FORCE_DARK,
-        }.get(theme, Adw.ColorScheme.DEFAULT)
-        Adw.StyleManager.get_default().set_color_scheme(scheme)
+        sm = Adw.StyleManager.get_default()
+        gs = Gtk.Settings.get_default()
+        if theme == 'light':
+            sm.set_color_scheme(Adw.ColorScheme.FORCE_LIGHT)
+            gs.set_property('gtk-theme-name', 'adw-gtk3')
+        elif theme == 'dark':
+            sm.set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+            gs.set_property('gtk-theme-name', 'adw-gtk3-dark')
+        else:  # system
+            if _COSMIC_IS_DARK.exists():
+                try:
+                    dark = _COSMIC_IS_DARK.read_text().strip().lower() == 'true'
+                    sm.set_color_scheme(
+                        Adw.ColorScheme.FORCE_DARK if dark else Adw.ColorScheme.FORCE_LIGHT)
+                    gs.set_property('gtk-theme-name',
+                                    'adw-gtk3-dark' if dark else 'adw-gtk3')
+                except Exception:
+                    sm.set_color_scheme(Adw.ColorScheme.DEFAULT)
+            else:
+                sm.set_color_scheme(Adw.ColorScheme.DEFAULT)
 
         MainWindow(application=app).present()
 
@@ -217,6 +248,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._hotkey_stop: threading.Event | None = None
         self._portal_conn = None
         self._portal_sub_id = None
+        self._theme_monitor = None
         self._system_mode = False
 
         self.config = self._load_config()
@@ -516,28 +548,70 @@ class MainWindow(Adw.ApplicationWindow):
             self._apply_system_theme()
         else:
             self._system_mode = False
-            scheme = (Adw.ColorScheme.FORCE_LIGHT if theme == 'light'
-                      else Adw.ColorScheme.FORCE_DARK)
-            Adw.StyleManager.get_default().set_color_scheme(scheme)
+            dark = (theme == 'dark')
+            Adw.StyleManager.get_default().set_color_scheme(
+                Adw.ColorScheme.FORCE_DARK if dark else Adw.ColorScheme.FORCE_LIGHT)
+            self._set_gtk_theme_name(dark)
+
+    def _set_gtk_theme_name(self, dark: bool):
+        """Switch gtk-theme-name between adw-gtk3 and adw-gtk3-dark.
+
+        COSMIC sets gtk-theme-name=adw-gtk3-dark (a fixed dark CSS theme) on
+        all GTK4 apps. Libadwaita's FORCE_LIGHT/FORCE_DARK only affects
+        libadwaita's own color variables; if the GTK theme CSS hard-codes dark
+        colors on top, the visual result is always dark. Switching the theme
+        name to the correct light/dark variant is required.
+        """
+        theme = 'adw-gtk3-dark' if dark else 'adw-gtk3'
+        Gtk.Settings.get_default().set_property('gtk-theme-name', theme)
 
     def _apply_system_theme(self):
-        """Let COSMIC manage the GTK4 theme automatically via DEFAULT, and
-        subscribe to the XDG portal SettingChanged signal for live updates.
+        """Apply the system theme and watch for live changes.
 
-        COSMIC automatically applies its system theme to GTK4 apps. Setting
-        DEFAULT tells libadwaita to follow the system; the portal signal fires
-        when the user switches light/dark in COSMIC Settings, at which point we
-        apply FORCE_DARK/FORCE_LIGHT to stay in sync.
+        On COSMIC the authoritative source is
+        ~/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark.
+        We read it immediately and use a GIO file monitor for live updates.
+        On non-COSMIC systems (GNOME etc.) we fall back to DEFAULT + the XDG
+        portal SettingChanged signal.
         """
-        # Start with DEFAULT — COSMIC will inject its own GTK theme on top
-        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.DEFAULT)
+        if _COSMIC_IS_DARK.exists():
+            self._apply_cosmic_system_theme()
+        else:
+            self._apply_portal_system_theme()
 
+    def _apply_cosmic_system_theme(self):
+        dark = self._read_cosmic_is_dark()
+        Adw.StyleManager.get_default().set_color_scheme(
+            Adw.ColorScheme.FORCE_DARK if dark else Adw.ColorScheme.FORCE_LIGHT)
+        self._set_gtk_theme_name(dark)
+
+        f = Gio.File.new_for_path(str(_COSMIC_IS_DARK))
+        mon = f.monitor_file(Gio.FileMonitorFlags.NONE, None)
+        mon.connect('changed', self._on_cosmic_theme_changed)
+        self._theme_monitor = mon
+
+    def _read_cosmic_is_dark(self) -> bool:
+        try:
+            return _COSMIC_IS_DARK.read_text().strip().lower() == 'true'
+        except Exception:
+            return False
+
+    def _on_cosmic_theme_changed(self, monitor, file, other, event_type):
+        if not self._system_mode:
+            return
+        if event_type not in (Gio.FileMonitorEvent.CHANGED,
+                               Gio.FileMonitorEvent.CREATED):
+            return
+        dark = self._read_cosmic_is_dark()
+        Adw.StyleManager.get_default().set_color_scheme(
+            Adw.ColorScheme.FORCE_DARK if dark else Adw.ColorScheme.FORCE_LIGHT)
+        self._set_gtk_theme_name(dark)
+
+    def _apply_portal_system_theme(self):
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.DEFAULT)
         try:
             conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
             self._portal_conn = conn
-
-            # Subscribe to live SettingChanged signals (fires when user
-            # changes light/dark in COSMIC Settings → Appearance)
             self._portal_sub_id = conn.signal_subscribe(
                 'org.freedesktop.portal.Desktop',
                 'org.freedesktop.portal.Settings',
@@ -547,29 +621,31 @@ class MainWindow(Adw.ApplicationWindow):
                 Gio.DBusSignalFlags.NONE,
                 self._on_portal_setting_changed,
             )
-            print('System theme: subscribed to portal SettingChanged', file=sys.stderr)
         except Exception as exc:
             print(f'Portal unavailable ({exc})', file=sys.stderr)
 
     def _on_portal_setting_changed(self, conn, sender, path, iface, signal, params):
         if not self._system_mode:
             return
-        namespace = params.get_child_value(0).get_string()
-        key = params.get_child_value(1).get_string()
-        if namespace != 'org.freedesktop.appearance' or key != 'color-scheme':
+        if params.get_child_value(0).get_string() != 'org.freedesktop.appearance':
+            return
+        if params.get_child_value(1).get_string() != 'color-scheme':
             return
         v = params.get_child_value(2)
         while v.get_type_string() == 'v':
             v = v.get_variant()
         try:
-            val = v.get_uint32()
+            dark = (v.get_uint32() == 1)
         except Exception:
             return
-        scheme = Adw.ColorScheme.FORCE_DARK if val == 1 else Adw.ColorScheme.FORCE_LIGHT
+        scheme = Adw.ColorScheme.FORCE_DARK if dark else Adw.ColorScheme.FORCE_LIGHT
         GLib.idle_add(Adw.StyleManager.get_default().set_color_scheme, scheme)
 
     def _disconnect_system_theme(self):
         self._system_mode = False
+        if self._theme_monitor:
+            self._theme_monitor.cancel()
+            self._theme_monitor = None
         if self._portal_conn and self._portal_sub_id is not None:
             self._portal_conn.signal_unsubscribe(self._portal_sub_id)
         self._portal_sub_id = None
@@ -714,57 +790,78 @@ class MainWindow(Adw.ApplicationWindow):
         self._hotkey_stop = stop
 
         def listener():
-            devices = _evdev_keyboards()
-            if not devices:
-                print('evdev: no keyboard devices found', file=sys.stderr)
-                GLib.idle_add(self._status_label.set_label,
-                              'Hotkey failed: no input devices (check input group)')
-                return
+            import time as _time
 
-            print(f'evdev hotkey listener started for: {hotkey_str} '
-                  f'on {len(devices)} device(s)', file=sys.stderr)
-
+            notified_no_devices = False
             pressed: set[str] = set()
             fired = False
 
+            # Outer loop: re-enumerate devices whenever the inner loop exits
             while not stop.is_set():
-                try:
-                    r, _, _ = select.select(devices, [], [], 0.05)
-                except (ValueError, OSError):
-                    break
-                for dev in r:
-                    try:
-                        for event in dev.read():
-                            if event.type != ecodes.EV_KEY:
-                                continue
-                            # Translate code → canonical token
-                            token = _EVDEV_MOD_CODES.get(event.code)
-                            if token is None:
-                                names = ecodes.KEY.get(event.code, '')
-                                token = (names[0] if isinstance(names, list)
-                                         else names) or None
-                            if not token:
-                                continue
+                devices = _evdev_keyboards()
+                if not devices:
+                    if not notified_no_devices:
+                        print('evdev: no keyboard devices found', file=sys.stderr)
+                        GLib.idle_add(self._status_label.set_label,
+                                      'Hotkey failed: no input devices (check input group)')
+                        notified_no_devices = True
+                    _time.sleep(1)
+                    continue
 
-                            if event.value == 1:       # key down
-                                pressed.add(token)
-                                print(f'[hotkey] ↓ {token}  pressed={pressed}  target={target}',
-                                      file=sys.stderr)
-                                if not fired and target <= pressed:
-                                    fired = True
-                                    GLib.idle_add(self._on_start_stop, None)
-                            elif event.value == 0:     # key up
-                                pressed.discard(token)
-                                if fired and not (target <= pressed):
-                                    fired = False
-                    except OSError:
+                notified_no_devices = False
+                print(f'evdev hotkey listener: monitoring {len(devices)} device(s) '
+                      f'for {hotkey_str}', file=sys.stderr)
+                pressed.clear()
+                fired = False
+
+                # Inner loop: read events until any error or stop
+                while not stop.is_set() and devices:
+                    try:
+                        r, _, _ = select.select(devices, [], [], 0.5)
+                    except (ValueError, OSError):
+                        break  # Re-enumerate on select failure
+
+                    for dev in list(r):
+                        try:
+                            for event in dev.read():
+                                if event.type != ecodes.EV_KEY:
+                                    continue
+                                # Translate code → canonical token
+                                token = _EVDEV_MOD_CODES.get(event.code)
+                                if token is None:
+                                    names = ecodes.KEY.get(event.code, '')
+                                    token = (names[0] if isinstance(names, list)
+                                             else names) or None
+                                if not token:
+                                    continue
+
+                                if event.value == 1:       # key down
+                                    pressed.add(token)
+                                    print(f'[hotkey] ↓ {token}  pressed={pressed}  target={target}',
+                                          file=sys.stderr)
+                                    if not fired and target <= pressed:
+                                        fired = True
+                                        GLib.idle_add(self._on_start_stop, None)
+                                elif event.value == 0:     # key up
+                                    pressed.discard(token)
+                                    if fired and not (target <= pressed):
+                                        fired = False
+                        except OSError:
+                            devices.remove(dev)
+                            try:
+                                dev.close()
+                            except Exception:
+                                pass
+
+                # Close all open devices before re-enumerating
+                for dev in devices:
+                    try:
+                        dev.close()
+                    except Exception:
                         pass
 
-            for dev in devices:
-                try:
-                    dev.close()
-                except Exception:
-                    pass
+                if not stop.is_set():
+                    _time.sleep(0.2)
 
         t = threading.Thread(target=listener, daemon=True)
         t.start()
