@@ -174,19 +174,24 @@ _KEYBOARD_REQUIRED_KEYS = frozenset({
     ecodes.KEY_A, ecodes.KEY_Z, ecodes.KEY_SPACE,
     ecodes.KEY_ENTER, ecodes.KEY_ESC, ecodes.KEY_LEFTSHIFT,
 })
+# Devices that report relative motion are mice/touchpads, not keyboards
+_MOUSE_CAPS = frozenset({ecodes.REL_X, ecodes.REL_Y})
 
 def _evdev_keyboards() -> list:
     """Return evdev InputDevice objects for physical keyboards only.
 
-    Requires a core set of keyboard keys to exclude mice, touchpads,
-    gamepads, and minimal virtual devices created by the compositor.
+    Requires a core set of keyboard keys and excludes any device that
+    also reports relative-motion events (mice, touchpads, gaming mice
+    with macro-key keyboard interfaces, etc.).
     """
     devices = []
     for path in evdev.list_devices():
         try:
             dev = evdev.InputDevice(path)
-            keys = set(dev.capabilities().get(ecodes.EV_KEY, []))
-            if _KEYBOARD_REQUIRED_KEYS.issubset(keys):
+            caps = dev.capabilities()
+            keys = set(caps.get(ecodes.EV_KEY, []))
+            rel  = set(caps.get(ecodes.EV_REL, []))
+            if _KEYBOARD_REQUIRED_KEYS.issubset(keys) and not (_MOUSE_CAPS & rel):
                 devices.append(dev)
             else:
                 dev.close()
@@ -814,14 +819,33 @@ class MainWindow(Adw.ApplicationWindow):
                 pressed.clear()
                 fired = False
 
-                # Inner loop: read events until any error or stop
-                while not stop.is_set() and devices:
-                    try:
-                        r, _, _ = select.select(devices, [], [], 0.5)
-                    except (ValueError, OSError):
-                        break  # Re-enumerate on select failure
+                # Inner loop: read events until any error or stop.
+                # Uses poll() instead of select() — no FD_SETSIZE (1024) limit.
+                poller = select.poll()
+                fd_map: dict[int, evdev.InputDevice] = {}
+                for dev in devices:
+                    poller.register(dev, select.POLLIN)
+                    fd_map[dev.fd] = dev
 
-                    for dev in list(r):
+                while not stop.is_set() and fd_map:
+                    try:
+                        ready = poller.poll(500)  # ms
+                    except OSError:
+                        break  # Re-enumerate on poll failure
+
+                    for fd, evt_mask in ready:
+                        dev = fd_map.get(fd)
+                        if dev is None:
+                            continue
+                        if evt_mask & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                            poller.unregister(fd)
+                            del fd_map[fd]
+                            devices.remove(dev)
+                            try:
+                                dev.close()
+                            except Exception:
+                                pass
+                            continue
                         try:
                             for event in dev.read():
                                 if event.type != ecodes.EV_KEY:
@@ -847,6 +871,8 @@ class MainWindow(Adw.ApplicationWindow):
                                     if fired and not (target <= pressed):
                                         fired = False
                         except OSError:
+                            poller.unregister(fd)
+                            del fd_map[fd]
                             devices.remove(dev)
                             try:
                                 dev.close()
