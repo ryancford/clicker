@@ -255,6 +255,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._portal_sub_id = None
         self._theme_monitor = None
         self._system_mode = False
+        self._uinput: evdev.UInput | None = None
 
         self.config = self._load_config()
         self._build_ui()
@@ -263,6 +264,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._theme_light_btn.connect('toggled', self._on_theme_radio_toggled)
         self._theme_dark_btn.connect('toggled', self._on_theme_radio_toggled)
         self._setup_hotkey()
+        self._init_uinput()
         self.connect('close-request', self._on_close_request)
 
     # ── Config ─────────────────────────────────────────────────────────────
@@ -917,13 +919,63 @@ class MainWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._status_label.set_label, 'Ready')
 
     def _click_loop(self, button_code, delay_ms, offset_ms, count, use_fixed, x, y):
-        """Inject clicks directly via a single persistent UInput device.
+        ui = self._uinput
+        if ui is None:
+            GLib.idle_add(self._status_label.set_label, 'UInput unavailable')
+            GLib.idle_add(self._stop_clicking)
+            return
 
-        One device is opened for the entire session — no per-click subprocess or
-        socket connection, so there is no fd churn in ydotoold (ydotoold not needed).
+        clicks_done = 0
+        while not self.stop_event.is_set():
+            if count > 0 and clicks_done >= count:
+                GLib.idle_add(self._stop_clicking)
+                break
+
+            try:
+                if use_fixed:
+                    # Slam cursor to top-left then move to target
+                    ui.write(ecodes.EV_REL, ecodes.REL_X, -99999)
+                    ui.write(ecodes.EV_REL, ecodes.REL_Y, -99999)
+                    ui.syn()
+                    ui.write(ecodes.EV_REL, ecodes.REL_X, x)
+                    ui.write(ecodes.EV_REL, ecodes.REL_Y, y)
+                    ui.syn()
+
+                ui.write(ecodes.EV_KEY, button_code, 1)  # press
+                ui.syn()
+                ui.write(ecodes.EV_KEY, button_code, 0)  # release
+                ui.syn()
+
+            except OSError as exc:
+                GLib.idle_add(self._status_label.set_label, f'Input error: {exc}')
+                GLib.idle_add(self._stop_clicking)
+                break
+
+            clicks_done += 1
+            label = (f'Clicking… ({clicks_done})'
+                     if count == 0 else
+                     f'Clicking… ({clicks_done} / {count})')
+            GLib.idle_add(self._status_label.set_label, label)
+
+            sleep_ms = delay_ms
+            if offset_ms > 0:
+                sleep_ms += random.uniform(-offset_ms, offset_ms)
+            self.stop_event.wait(max(1.0, sleep_ms) / 1000.0)
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _init_uinput(self):
+        """Create the persistent UInput device used for all click injection.
+
+        Created once at startup rather than per click session so that the
+        Wayland compositor only sees one udev 'device added' event total.
+        Repeated create/destroy cycles caused COSMIC to accumulate open fds
+        for each virtual device, eventually exhausting its own fd table.
         """
+        if not EVDEV_AVAILABLE:
+            return
         try:
-            ui = evdev.UInput(
+            self._uinput = evdev.UInput(
                 {
                     ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE],
                     ecodes.EV_REL: [ecodes.REL_X, ecodes.REL_Y],
@@ -931,56 +983,17 @@ class MainWindow(Adw.ApplicationWindow):
                 name='auto-clicker',
             )
         except Exception as exc:
-            GLib.idle_add(self._status_label.set_label, f'UInput error: {exc}')
-            GLib.idle_add(self._stop_clicking)
-            return
-
-        clicks_done = 0
-        try:
-            while not self.stop_event.is_set():
-                if count > 0 and clicks_done >= count:
-                    GLib.idle_add(self._stop_clicking)
-                    break
-
-                try:
-                    if use_fixed:
-                        # Slam cursor to top-left then move to target
-                        ui.write(ecodes.EV_REL, ecodes.REL_X, -99999)
-                        ui.write(ecodes.EV_REL, ecodes.REL_Y, -99999)
-                        ui.syn()
-                        ui.write(ecodes.EV_REL, ecodes.REL_X, x)
-                        ui.write(ecodes.EV_REL, ecodes.REL_Y, y)
-                        ui.syn()
-
-                    ui.write(ecodes.EV_KEY, button_code, 1)  # press
-                    ui.syn()
-                    ui.write(ecodes.EV_KEY, button_code, 0)  # release
-                    ui.syn()
-
-                except OSError as exc:
-                    GLib.idle_add(self._status_label.set_label, f'Input error: {exc}')
-                    GLib.idle_add(self._stop_clicking)
-                    break
-
-                clicks_done += 1
-                label = (f'Clicking… ({clicks_done})'
-                         if count == 0 else
-                         f'Clicking… ({clicks_done} / {count})')
-                GLib.idle_add(self._status_label.set_label, label)
-
-                sleep_ms = delay_ms
-                if offset_ms > 0:
-                    sleep_ms += random.uniform(-offset_ms, offset_ms)
-                self.stop_event.wait(max(1.0, sleep_ms) / 1000.0)
-        finally:
-            ui.close()
-
-    # ── Helpers ─────────────────────────────────────────────────────────────
+            print(f'UInput init failed: {exc}', file=sys.stderr)
 
     def _on_close_request(self, _win) -> bool:
         self._stop_hotkey_listener()
         self._disconnect_system_theme()
         self._save_all_settings()
+        if self._uinput:
+            try:
+                self._uinput.close()
+            except Exception:
+                pass
         return False  # allow the window to close
 
     def _save_all_settings(self):
