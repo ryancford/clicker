@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Auto Clicker — GTK4 / libadwaita mouse automation tool."""
 
+import os
+# Disable GTK4's wp_linux_drm_syncobj_v1 explicit-sync protocol before GTK
+# is initialised.  On NVidia + COSMIC the compositor hits its DRM sync-object
+# limit ("import_timeline: dup failed: Too many open files") because the
+# driver caps the number of active timeline objects per process.  Opting out
+# makes GTK4 fall back to the older implicit-sync path with no visible effect
+# on correctness or performance for a UI app like this.
+os.environ.setdefault('GDK_DISABLE', 'drm-syncobj')
+
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
@@ -8,7 +17,6 @@ gi.require_version('Gdk', '4.0')
 from gi.repository import Gtk, Adw, Gdk, GLib, Gio
 
 import json
-import os
 import random
 import select
 import subprocess
