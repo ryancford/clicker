@@ -2,12 +2,19 @@
 """Auto Clicker — GTK4 / libadwaita mouse automation tool."""
 
 import os
-# Disable GTK4's wp_linux_drm_syncobj_v1 explicit-sync protocol before GTK
-# is initialised.  On NVidia + COSMIC the compositor hits its DRM sync-object
-# limit ("import_timeline: dup failed: Too many open files") because the
-# driver caps the number of active timeline objects per process.  Opting out
-# makes GTK4 fall back to the older implicit-sync path with no visible effect
-# on correctness or performance for a UI app like this.
+# Force Cairo (software) renderer and disable explicit-sync before GTK loads.
+#
+# On NVidia + COSMIC, the wp_linux_drm_syncobj_v1 Wayland protocol causes
+# the compositor to dup() DRM timeline fds until it hits its open-file limit
+# ("import_timeline: dup failed: Too many open files").  Two guards:
+#
+#   GSK_RENDERER=cairo   — use CPU-side Cairo renderer; completely avoids all
+#                          DRM/GPU object allocation.  Imperceptible for a
+#                          simple UI like this clicker.
+#   GDK_DISABLE=drm-syncobj — belt-and-suspenders: tells GTK ≥4.14 not to
+#                          negotiate the explicit-sync protocol even if a
+#                          GPU renderer is somehow active.
+os.environ.setdefault('GSK_RENDERER', 'cairo')
 os.environ.setdefault('GDK_DISABLE', 'drm-syncobj')
 
 import gi
