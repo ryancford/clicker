@@ -812,84 +812,93 @@ class MainWindow(Adw.ApplicationWindow):
         self._hotkey_stop = stop
 
         def listener():
-            devices = _evdev_keyboards()
-            if not devices:
-                print('evdev: no keyboard devices found', file=sys.stderr)
-                GLib.idle_add(self._status_label.set_label,
-                              'Hotkey failed: no input devices (check input group)')
-                return
-
-            print(f'evdev hotkey listener: monitoring {len(devices)} device(s) '
-                  f'for {hotkey_str}', file=sys.stderr)
-
-            pressed: set[str] = set()
-            fired = False
-
-            # Uses poll() — no FD_SETSIZE (1024) fd-number limit like select().
-            # Devices are opened once and never re-enumerated; re-enumeration
-            # fires udev events that cause the Wayland compositor to allocate
-            # fds, which can exhaust its own fd table.
-            poller = select.poll()
-            fd_map: dict[int, evdev.InputDevice] = {}
-            for dev in devices:
-                poller.register(dev, select.POLLIN)
-                fd_map[dev.fd] = dev
+            import time
 
             while not stop.is_set():
-                try:
-                    ready = poller.poll(500)  # ms
-                except OSError:
-                    break
+                devices = _evdev_keyboards()
+                if not devices:
+                    print('evdev: no keyboard devices found', file=sys.stderr)
+                    GLib.idle_add(self._status_label.set_label,
+                                  'Hotkey failed: no input devices (check input group)')
+                    return
 
-                for fd, evt_mask in ready:
-                    dev = fd_map.get(fd)
-                    if dev is None:
-                        continue
-                    if evt_mask & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
-                        poller.unregister(fd)
-                        del fd_map[fd]
-                        try:
-                            dev.close()
-                        except Exception:
-                            pass
-                        continue
+                print(f'evdev hotkey listener: monitoring {len(devices)} device(s) '
+                      f'for {hotkey_str}', file=sys.stderr)
+
+                # Reset key state on each (re-)enumeration so stale pressed/fired
+                # state from before a device disconnect never blocks the hotkey.
+                pressed: set[str] = set()
+                fired = False
+
+                # poll() has no FD_SETSIZE (1024) limit unlike select().
+                poller = select.poll()
+                fd_map: dict[int, evdev.InputDevice] = {}
+                for dev in devices:
+                    poller.register(dev, select.POLLIN)
+                    fd_map[dev.fd] = dev
+
+                while not stop.is_set() and fd_map:
                     try:
-                        for event in dev.read():
-                            if event.type != ecodes.EV_KEY:
-                                continue
-                            # Translate code → canonical token
-                            token = _EVDEV_MOD_CODES.get(event.code)
-                            if token is None:
-                                names = ecodes.KEY.get(event.code, '')
-                                token = (names[0] if isinstance(names, list)
-                                         else names) or None
-                            if not token:
-                                continue
-
-                            if event.value == 1:       # key down
-                                pressed.add(token)
-                                print(f'[hotkey] ↓ {token}  pressed={pressed}  target={target}',
-                                      file=sys.stderr)
-                                if not fired and target <= pressed:
-                                    fired = True
-                                    GLib.idle_add(self._on_start_stop, None)
-                            elif event.value == 0:     # key up
-                                pressed.discard(token)
-                                if fired and not (target <= pressed):
-                                    fired = False
+                        ready = poller.poll(500)  # ms
                     except OSError:
-                        poller.unregister(fd)
-                        del fd_map[fd]
-                        try:
-                            dev.close()
-                        except Exception:
-                            pass
+                        break
 
-            for dev in fd_map.values():
-                try:
-                    dev.close()
-                except Exception:
-                    pass
+                    for fd, evt_mask in ready:
+                        dev = fd_map.get(fd)
+                        if dev is None:
+                            continue
+                        if evt_mask & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                            poller.unregister(fd)
+                            del fd_map[fd]
+                            try:
+                                dev.close()
+                            except Exception:
+                                pass
+                            continue
+                        try:
+                            for event in dev.read():
+                                if event.type != ecodes.EV_KEY:
+                                    continue
+                                # Translate code → canonical token
+                                token = _EVDEV_MOD_CODES.get(event.code)
+                                if token is None:
+                                    names = ecodes.KEY.get(event.code, '')
+                                    token = (names[0] if isinstance(names, list)
+                                             else names) or None
+                                if not token:
+                                    continue
+
+                                if event.value == 1:       # key down
+                                    pressed.add(token)
+                                    print(f'[hotkey] ↓ {token}  pressed={pressed}  target={target}',
+                                          file=sys.stderr)
+                                    if not fired and target <= pressed:
+                                        fired = True
+                                        GLib.idle_add(self._on_start_stop, None)
+                                elif event.value == 0:     # key up
+                                    pressed.discard(token)
+                                    if fired and not (target <= pressed):
+                                        fired = False
+                        except OSError:
+                            poller.unregister(fd)
+                            del fd_map[fd]
+                            try:
+                                dev.close()
+                            except Exception:
+                                pass
+
+                # Close any remaining devices before re-enumerating.
+                for dev in fd_map.values():
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+
+                if not stop.is_set():
+                    # Brief pause before re-enumerating to avoid a tight loop
+                    # if devices keep failing immediately.
+                    print('evdev: device(s) lost, re-enumerating in 2 s…', file=sys.stderr)
+                    time.sleep(2)
 
         t = threading.Thread(target=listener, daemon=True)
         t.start()
