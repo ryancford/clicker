@@ -817,10 +817,11 @@ class MainWindow(Adw.ApplicationWindow):
             while not stop.is_set():
                 devices = _evdev_keyboards()
                 if not devices:
-                    print('evdev: no keyboard devices found', file=sys.stderr)
+                    print('evdev: no keyboard devices found, retrying in 5 s…', file=sys.stderr)
                     GLib.idle_add(self._status_label.set_label,
-                                  'Hotkey failed: no input devices (check input group)')
-                    return
+                                  'Hotkey: no input devices (check input group)')
+                    time.sleep(5)
+                    continue
 
                 print(f'evdev hotkey listener: monitoring {len(devices)} device(s) '
                       f'for {hotkey_str}', file=sys.stderr)
