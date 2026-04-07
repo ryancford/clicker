@@ -2,20 +2,20 @@
 """Auto Clicker — GTK4 / libadwaita mouse automation tool."""
 
 import os
-# Force Cairo (software) renderer and disable explicit-sync before GTK loads.
+# Run under XWayland (X11 backend) to completely sidestep the
+# wp_linux_drm_syncobj_v1 Wayland explicit-sync protocol.
 #
-# On NVidia + COSMIC, the wp_linux_drm_syncobj_v1 Wayland protocol causes
-# the compositor to dup() DRM timeline fds until it hits its open-file limit
-# ("import_timeline: dup failed: Too many open files").  Two guards:
+# On NVidia + COSMIC, the compositor accumulates DRM timeline fds for every
+# Wayland surface that uses explicit sync, eventually exhausting its open-file
+# limit ("import_timeline: dup failed: Too many open files").  GDK_DISABLE and
+# GSK_RENDERER overrides proved insufficient — GTK still negotiates the
+# protocol.  Forcing GDK_BACKEND=x11 makes GTK talk X11 via XWayland instead,
+# which has no concept of DRM timeline objects.
 #
-#   GSK_RENDERER=cairo   — use CPU-side Cairo renderer; completely avoids all
-#                          DRM/GPU object allocation.  Imperceptible for a
-#                          simple UI like this clicker.
-#   GDK_DISABLE=drm-syncobj — belt-and-suspenders: tells GTK ≥4.14 not to
-#                          negotiate the explicit-sync protocol even if a
-#                          GPU renderer is somehow active.
-os.environ.setdefault('GSK_RENDERER', 'cairo')
-os.environ.setdefault('GDK_DISABLE', 'drm-syncobj')
+# The app uses no Wayland-specific features: the evdev hotkey listener and
+# UInput click injection are kernel interfaces that work regardless of display
+# backend, and libadwaita renders correctly under XWayland.
+os.environ.setdefault('GDK_BACKEND', 'x11')
 
 import gi
 gi.require_version('Gtk', '4.0')
